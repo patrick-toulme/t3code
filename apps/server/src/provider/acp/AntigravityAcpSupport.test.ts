@@ -17,6 +17,7 @@ import { resolveAttachmentPath } from "../../attachmentStore.ts";
 import {
   applyAntigravityAcpModelSelection,
   antigravitySessionMeta,
+  antigravityUndescribedModels,
   buildAntigravityPrompt,
   isQualifiedAntigravityRelease,
 } from "./AntigravityAcpSupport.ts";
@@ -31,6 +32,41 @@ const modelConfig = {
     { value: "gemini-saved", name: "Gemini saved" },
   ],
 } satisfies EffectAcpSchema.SessionConfigOption;
+
+const thinkingLevels = [
+  { value: "low", name: "Low" },
+  { value: "high", name: "High" },
+];
+
+// The agent carries the previous model's level over to a picked model.
+const thinkingConfig = {
+  id: "thinking_level",
+  name: "Thinking Level",
+  category: "thought_level",
+  type: "select",
+  currentValue: "high",
+  options: thinkingLevels,
+} satisfies EffectAcpSchema.SessionConfigOption;
+
+const describedConfigOptions = [
+  {
+    ...modelConfig,
+    currentValue: "gemini-3.8-flash",
+    options: [
+      {
+        value: "gemini-3.8-flash",
+        name: "Gemini 3.8 Flash",
+        _meta: { antigravity: { thinkingLevels, defaultThinkingLevel: "high" } },
+      },
+      {
+        value: "agy-model",
+        name: "Gemini 4 Carbon",
+        _meta: { antigravity: { thinkingLevels, defaultThinkingLevel: "low" } },
+      },
+    ],
+  },
+  thinkingConfig,
+] satisfies ReadonlyArray<EffectAcpSchema.SessionConfigOption>;
 
 function makeModelRuntime(
   configOptions: ReadonlyArray<EffectAcpSchema.SessionConfigOption> = [modelConfig],
@@ -207,6 +243,73 @@ describe("applyAntigravityAcpModelSelection", () => {
       expect(selections).toEqual(["model=gemini-3.8-flash-low (unlisted)"]);
     }),
   );
+
+  it.effect("passes a saved model ID to the agent as the model it names for that ID", () =>
+    Effect.gen(function* () {
+      const { runtime, selections } = makeModelRuntime([
+        {
+          ...modelConfig,
+          currentValue: "gemini-3.8-flash",
+          options: [
+            { value: "gemini-3.8-flash", name: "Gemini 3.8 Flash" },
+            { value: "gemini-3.1-pro", name: "Gemini 3.1 Pro" },
+          ],
+        },
+      ]);
+      const model = yield* applyAntigravityAcpModelSelection({
+        runtime,
+        model: "gemini-pro-agent",
+        legacyModels: {
+          currentModelId: "gemini-3.8-flash-high",
+          availableModels: [
+            {
+              modelId: "gemini-pro-agent",
+              name: "Gemini 3.1 Pro (High)",
+              _meta: {
+                antigravity: {
+                  configOptionValues: { model: "gemini-3.1-pro", thinking_level: "high" },
+                },
+              },
+            },
+          ],
+        },
+        mapError: (cause) => cause,
+      });
+
+      expect(model).toBe("gemini-3.1-pro");
+      expect(selections).toEqual(["model=gemini-pro-agent (unlisted)"]);
+    }),
+  );
+
+  it.effect("applies a picked model's default thinking level unless the user chose one", () =>
+    Effect.gen(function* () {
+      const select = Effect.fn("AntigravityAcpSupportTest.selectCarbon")(function* (
+        chosenOptions?: ReadonlyArray<{ readonly id: string; readonly value: string }>,
+      ) {
+        const { runtime, selections } = makeModelRuntime(describedConfigOptions);
+        yield* applyAntigravityAcpModelSelection({
+          runtime,
+          model: "agy-model",
+          chosenOptions,
+          mapError: (cause) => cause,
+        });
+        return selections;
+      });
+
+      expect(yield* select()).toEqual(["agy-model", "thinking_level=low"]);
+      // The user's own level is applied after the model, with the other session options.
+      expect(yield* select([{ id: "thinking_level", value: "high" }])).toEqual(["agy-model"]);
+    }),
+  );
+});
+
+describe("antigravityUndescribedModels", () => {
+  it("leaves out models that describe their own thinking levels", () => {
+    expect(antigravityUndescribedModels(describedConfigOptions)).toEqual([]);
+    expect(
+      antigravityUndescribedModels([modelConfig, thinkingConfig]).map(({ value }) => value),
+    ).toEqual(["gemini-default", "gemini-saved"]);
+  });
 });
 
 const imageAttachment = {

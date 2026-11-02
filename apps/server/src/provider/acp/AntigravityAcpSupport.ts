@@ -3,6 +3,7 @@ import {
   type AntigravityAuthMethod,
   PROVIDER_SEND_TURN_MAX_FILE_BYTES,
   PROVIDER_SEND_TURN_MAX_IMAGE_BYTES,
+  type ProviderOptionSelection,
   type ProviderSendTurnInput,
   type RuntimeMode,
 } from "@t3tools/contracts";
@@ -11,7 +12,9 @@ import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Path from "effect/Path";
+import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
@@ -175,7 +178,7 @@ export function antigravityRuntimeModeForSessionMode(modeId: string): RuntimeMod
   }
 }
 
-export function antigravityModelOptions(
+function antigravityModelOptions(
   configOptions: ReadonlyArray<EffectAcpSchema.SessionConfigOption>,
 ) {
   const model = configOptions.find((option) => option.id === "model");
@@ -191,22 +194,59 @@ export function antigravityThinkingConfig(
   return option?.type === "select" ? option : undefined;
 }
 
+const decodeDescribedThinking = Schema.decodeUnknownOption(
+  Schema.Struct({
+    antigravity: Schema.Struct({
+      thinkingLevels: Schema.Array(Schema.Struct({ value: Schema.String, name: Schema.String })),
+      defaultThinkingLevel: Schema.optional(Schema.String),
+    }),
+  }),
+);
+
+/** Newer runtimes describe each model's thinking levels; older ones only the selected model's. */
+export function antigravityDescribedThinking(entry: EffectAcpSchema.SessionConfigSelectOption) {
+  return Option.getOrUndefined(decodeDescribedThinking(entry._meta))?.antigravity;
+}
+
+/** Models whose thinking levels T3 can only read by selecting each one. */
+export function antigravityUndescribedModels(
+  configOptions: ReadonlyArray<EffectAcpSchema.SessionConfigOption>,
+) {
+  if (antigravityThinkingConfig(configOptions) === undefined) return [];
+  return antigravityModelOptions(configOptions).filter(
+    (entry) => antigravityDescribedThinking(entry) === undefined,
+  );
+}
+
+const decodeLegacyModelValues = Schema.decodeUnknownOption(
+  Schema.Struct({
+    antigravity: Schema.Struct({ configOptionValues: Schema.Struct({ model: Schema.String }) }),
+  }),
+);
+
 /**
  * Runtime 1.4 lists `gemini-3.8-flash` where 1.3 listed `gemini-3.8-flash-high`. The agent
  * still accepts the old IDs, so pass them through; the current model may have no thinking option.
+ * Newer runtimes name each old ID's model; for older ones, the longest listed prefix wins.
  */
 function legacyAntigravityFamily(
   configOptions: ReadonlyArray<EffectAcpSchema.SessionConfigOption>,
+  legacyModels: EffectAcpSchema.SessionModelState | null | undefined,
   model: string,
 ) {
-  return antigravityModelOptions(configOptions)
-    .map((option) => option.value)
+  const families = antigravityModelOptions(configOptions).map((option) => option.value);
+  const legacy = legacyModels?.availableModels.find((entry) => entry.modelId === model);
+  const named = Option.getOrUndefined(decodeLegacyModelValues(legacy?._meta))?.antigravity
+    .configOptionValues.model;
+  if (named !== undefined) return families.includes(named) ? named : undefined;
+  return families
     .filter((family) => model.startsWith(`${family}-`))
     .toSorted((left, right) => right.length - left.length)[0];
 }
 
 function resolveAntigravityModel(input: {
   readonly configOptions: ReadonlyArray<EffectAcpSchema.SessionConfigOption>;
+  readonly legacyModels: EffectAcpSchema.SessionModelState | null | undefined;
   readonly model: string | null | undefined;
   readonly defaultModel?: string | undefined;
 }): string | undefined {
@@ -216,10 +256,32 @@ function resolveAntigravityModel(input: {
   const options = antigravityModelOptions(input.configOptions);
   return input.defaultModel &&
     (options.some((option) => option.value === input.defaultModel) ||
-      legacyAntigravityFamily(input.configOptions, input.defaultModel) !== undefined)
+      legacyAntigravityFamily(input.configOptions, input.legacyModels, input.defaultModel) !==
+        undefined)
     ? input.defaultModel
     : current;
 }
+
+/** The agent carries the previous model's thinking level over to a picked model. */
+const applyDescribedDefaultThinking = Effect.fn("applyAntigravityDescribedDefaultThinking")(
+  function* <E>(input: {
+    readonly runtime: Pick<
+      AcpSessionRuntime.AcpSessionRuntime["Service"],
+      "getConfigOptions" | "setConfigOption"
+    >;
+    readonly model: string;
+    readonly chosenOptions?: ReadonlyArray<ProviderOptionSelection> | undefined;
+    readonly mapError: (cause: EffectAcpErrors.AcpError) => E;
+  }): Effect.fn.Return<void, E> {
+    const configOptions = yield* input.runtime.getConfigOptions;
+    const thinking = antigravityThinkingConfig(configOptions);
+    if (thinking === undefined || input.chosenOptions?.some(({ id }) => id === thinking.id)) return;
+    const entry = antigravityModelOptions(configOptions).find(({ value }) => value === input.model);
+    const level = entry && antigravityDescribedThinking(entry)?.defaultThinkingLevel;
+    if (level === undefined || level === thinking.currentValue) return;
+    yield* input.runtime.setConfigOption(thinking.id, level).pipe(Effect.mapError(input.mapError));
+  },
+);
 
 /** Never replace a saved selection with the default returned by a cold resume. */
 export const applyAntigravityAcpModelSelection = Effect.fn("applyAntigravityAcpModelSelection")(
@@ -230,6 +292,10 @@ export const applyAntigravityAcpModelSelection = Effect.fn("applyAntigravityAcpM
     >;
     readonly model: string | null | undefined;
     readonly defaultModel?: string | undefined;
+    /** The session's flat model list, which names each old model ID's current model. */
+    readonly legacyModels?: EffectAcpSchema.SessionModelState | null | undefined;
+    /** Options the user picked; a thinking level left unpicked takes the model's default. */
+    readonly chosenOptions?: ReadonlyArray<ProviderOptionSelection> | undefined;
     readonly mapError: (cause: EffectAcpErrors.AcpError) => E;
   }): Effect.fn.Return<string | undefined, E> {
     const configOptions = yield* input.runtime.getConfigOptions;
@@ -237,16 +303,22 @@ export const applyAntigravityAcpModelSelection = Effect.fn("applyAntigravityAcpM
     const current = modelConfig?.type === "select" ? modelConfig.currentValue : undefined;
     const resolved = resolveAntigravityModel({
       configOptions,
+      legacyModels: input.legacyModels,
       model: input.model,
       defaultModel: input.defaultModel,
     });
     const explicit = Boolean(input.model) && input.model !== ANTIGRAVITY_DEFAULT_MODEL;
-    if (resolved === undefined || (!explicit && resolved === current)) return current;
+    if (resolved === undefined) return current;
+    if (!explicit && resolved === current) {
+      yield* applyDescribedDefaultThinking({ ...input, model: resolved });
+      return current;
+    }
     const options = antigravityModelOptions(configOptions);
     const legacyFamily = options.some((option) => option.value === resolved)
       ? undefined
-      : legacyAntigravityFamily(configOptions, resolved);
+      : legacyAntigravityFamily(configOptions, input.legacyModels, resolved);
     if (legacyFamily !== undefined) {
+      // The old ID carries its own thinking level.
       yield* input.runtime
         .setConfigOption("model", resolved, { allowUnlistedValue: true })
         .pipe(Effect.mapError(input.mapError));
@@ -262,6 +334,7 @@ export const applyAntigravityAcpModelSelection = Effect.fn("applyAntigravityAcpM
       );
     }
     yield* input.runtime.setModel(resolved).pipe(Effect.mapError(input.mapError));
+    yield* applyDescribedDefaultThinking({ ...input, model: resolved });
     return resolved;
   },
 );

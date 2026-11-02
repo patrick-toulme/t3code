@@ -286,6 +286,59 @@ describe("Antigravity model catalog", () => {
     expect(thinkingOf("unseen")).toMatchObject({ id: "thinking_level" });
     expect(thinkingOf("unseen")).not.toHaveProperty("currentValue");
   });
+
+  it("prefers the thinking levels and default each model describes", () => {
+    const levels = [
+      { value: "low", name: "Low" },
+      { value: "high", name: "High" },
+    ];
+    const thinking = (currentValue: string) =>
+      ({
+        id: "thinking_level",
+        name: "Thinking Level",
+        category: "thought_level",
+        type: "select",
+        currentValue,
+        options: levels,
+      }) satisfies EffectAcpSchema.SessionConfigOption;
+    const described = (defaultThinkingLevel?: string) => ({
+      antigravity: {
+        thinkingLevels: defaultThinkingLevel === undefined ? [] : levels,
+        ...(defaultThinkingLevel === undefined ? {} : { defaultThinkingLevel }),
+      },
+    });
+    const build = (currentValue: string, currentLevel?: string) =>
+      buildAntigravityModelsFromSession(
+        {
+          configOptions: [
+            {
+              ...modelConfig,
+              currentValue,
+              options: [
+                { value: "flash", name: "Flash", _meta: described("high") },
+                { value: "carbon", name: "Carbon", _meta: described("low") },
+                { value: "claude", name: "Claude", _meta: described() },
+              ],
+            },
+            ...(currentLevel === undefined ? [] : [thinking(currentLevel)]),
+          ],
+        },
+        new Map([["carbon", thinking("high")]]),
+      ).map((model) => [model.slug, model.capabilities?.optionDescriptors?.[0]]);
+
+    // Levels seen after selecting a model may have carried over from the previous one.
+    expect(Object.fromEntries(build("flash", "low"))).toMatchObject({
+      flash: { id: "thinking_level", currentValue: "high" },
+      carbon: { id: "thinking_level", currentValue: "low" },
+      claude: undefined,
+    });
+    // Without a selected thinking option, the levels still belong to the agent's option.
+    expect(Object.fromEntries(build("claude"))).toMatchObject({
+      flash: { id: "thinking_level", currentValue: "high" },
+      carbon: { id: "thinking_level", currentValue: "low" },
+      claude: undefined,
+    });
+  });
 });
 
 it.layer(layerTest)("Antigravity provider snapshots", (it) => {

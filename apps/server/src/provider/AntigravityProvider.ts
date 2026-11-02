@@ -36,7 +36,10 @@ import {
 } from "@t3tools/provider-core/server/snapshotProbe";
 import { resolveUsageLimitsAfterProbe } from "@t3tools/provider-core/server/usageLimits";
 
-import { antigravityThinkingConfig } from "./acp/AntigravityAcpSupport.ts";
+import {
+  antigravityDescribedThinking,
+  antigravityThinkingConfig,
+} from "./acp/AntigravityAcpSupport.ts";
 
 const EMPTY_MODEL_CAPABILITIES = createModelCapabilities({ optionDescriptors: [] });
 const MAX_WORKSPACE_SNAPSHOTS = 32;
@@ -69,6 +72,22 @@ function thinkingCapabilities(config: ThinkingConfig | null | undefined, observe
   return createModelCapabilities({ optionDescriptors: [observed ? descriptor : unobserved] });
 }
 
+function describedThinkingConfig(
+  described: NonNullable<ReturnType<typeof antigravityDescribedThinking>>,
+  selectedThinking: ThinkingConfig | undefined,
+): ThinkingConfig | null {
+  if (described.thinkingLevels.length === 0) return null;
+  return {
+    // The agent lists no thinking option while the selected model has no levels.
+    id: selectedThinking?.id ?? "thinking_level",
+    name: selectedThinking?.name ?? "Thinking Level",
+    category: "thought_level",
+    type: "select",
+    currentValue: described.defaultThinkingLevel ?? "",
+    options: described.thinkingLevels,
+  };
+}
+
 export function buildAntigravityModelsFromSession(
   setup: SessionSetupResult,
   thinkingLevels: AntigravityThinkingLevels = new Map(),
@@ -97,8 +116,13 @@ export function buildAntigravityModelsFromSession(
     const baseName = entry.name.trim() ? entry.name : entry.value;
     const name = names.has(baseName) ? `${baseName} (${entry.value})` : baseName;
     names.add(baseName);
+    const described = antigravityDescribedThinking(entry);
     const observed =
-      entry.value === currentValue ? (currentThinking ?? null) : thinkingLevels.get(entry.value);
+      described !== undefined
+        ? describedThinkingConfig(described, currentThinking)
+        : entry.value === currentValue
+          ? (currentThinking ?? null)
+          : thinkingLevels.get(entry.value);
     return [
       {
         slug: entry.value,

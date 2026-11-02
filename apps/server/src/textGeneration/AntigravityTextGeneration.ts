@@ -242,6 +242,7 @@ export const makeAntigravityTextGeneration = Effect.fn("makeAntigravityTextGener
               runtime,
               model: input.modelSelection.model,
               defaultModel: yield* options.defaultModel ?? Effect.undefined,
+              legacyModels: started.sessionSetupResult.models,
               mapError: (cause) =>
                 new TextGenerationError({
                   operation,

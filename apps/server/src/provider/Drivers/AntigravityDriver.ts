@@ -38,8 +38,7 @@ import {
   type AntigravityAuthConfig,
 } from "../antigravityAuthSupport.ts";
 import {
-  antigravityModelOptions,
-  antigravityThinkingConfig,
+  antigravityUndescribedModels,
   makeAntigravityAcpRuntime,
   type AntigravityAcpRuntimeInput,
 } from "../acp/AntigravityAcpSupport.ts";
@@ -334,11 +333,12 @@ export const AntigravityDriver: ProviderDriver<
           ? provider.onAvailableCommands(event.availableCommands)
           : Effect.void;
       }).pipe(Effect.forkScoped);
-      // Thinking levels differ per model and are reported only for the selected one.
+      // Thinking levels differ per model, and older runtimes report them only for the selected one.
       const configOptions = started.sessionSetupResult.configOptions ?? [];
       const current = configOptions.find((option) => option.id === "model")?.currentValue;
-      if (antigravityThinkingConfig(configOptions) !== undefined && typeof current === "string") {
-        for (const model of [...antigravityModelOptions(configOptions), { value: current }]) {
+      const undescribed = antigravityUndescribedModels(configOptions);
+      if (undescribed.length > 0 && typeof current === "string") {
+        for (const model of [...undescribed, { value: current }]) {
           yield* runtime.setModel(model.value).pipe(Effect.ignore);
         }
       }

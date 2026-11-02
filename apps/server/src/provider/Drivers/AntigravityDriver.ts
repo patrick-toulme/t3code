@@ -65,7 +65,11 @@ import {
 } from "@t3tools/provider-core/server/driver";
 import { mergeProviderInstanceEnvironment } from "@t3tools/provider-core/server/instanceEnvironment";
 import { withInstanceIdentity } from "@t3tools/provider-core/server/instanceIdentity";
-import { discoverAntigravitySkills, resolveAntigravityUserHome } from "./AntigravitySkills.ts";
+import {
+  antigravityListedSkills,
+  discoverAntigravitySkills,
+  resolveAntigravityUserHome,
+} from "./AntigravitySkills.ts";
 
 const DRIVER = ProviderDriverKind.make("antigravity");
 const decodeSettings = Schema.decodeSync(AntigravitySettings);
@@ -331,7 +335,11 @@ export const AntigravityDriver: ProviderDriver<
           return provider.onConfigOptionsUpdated(event.configOptions);
         }
         return event._tag === "AvailableCommandsUpdated"
-          ? provider.onAvailableCommands(event.availableCommands)
+          ? provider.onAvailableCommands(
+              event.availableCommands,
+              undefined,
+              antigravityListedSkills(path, undefined, event.availableCommands),
+            )
           : Effect.void;
       }).pipe(Effect.forkScoped);
       // Thinking levels differ per model and are reported only for the selected one.
@@ -436,14 +444,13 @@ export const AntigravityDriver: ProviderDriver<
       defaultModel,
       profileDirectory,
       onSessionStarted: provider.onSessionStarted,
-      onSessionEvent: (event) => {
-        if (event._tag === "ConfigOptionsUpdated") {
-          return provider.onConfigOptionsUpdated(event.configOptions);
-        }
-        return event._tag === "AvailableCommandsUpdated"
-          ? provider.onAvailableCommands(event.availableCommands)
-          : Effect.void;
-      },
+      onSessionEvent: (event) =>
+        event._tag === "ConfigOptionsUpdated"
+          ? provider.onConfigOptionsUpdated(event.configOptions)
+          : Effect.void,
+      onAvailableCommands: (commands, cwd) =>
+        provider.onAvailableCommands(commands, cwd, antigravityListedSkills(path, cwd, commands)),
+      listedSkills: provider.listedSkills,
       continuationRequests,
       nativeLogging: (threadId) =>
         makeNativeLogger({
@@ -521,20 +528,22 @@ export const AntigravityDriver: ProviderDriver<
       snapshotForCwd: (cwd) =>
         !enabled
           ? provider.snapshot.getSnapshot
-          : discoverAntigravitySkills({ cwd, userHome }).pipe(
-              Effect.provideService(FileSystem.FileSystem, fileSystem),
-              Effect.provideService(Path.Path, path),
-              Effect.flatMap((skills) => provider.snapshotForCwd(cwd, skills)),
-              Effect.mapError(
-                (cause) =>
-                  new ProviderDriverError({
-                    driver: DRIVER,
-                    instanceId,
-                    detail: "Could not read Antigravity workspace skills.",
-                    cause,
-                  }),
+          : provider.listedSkills(cwd) !== undefined
+            ? provider.snapshotForCwd(cwd)
+            : discoverAntigravitySkills({ cwd, userHome }).pipe(
+                Effect.provideService(FileSystem.FileSystem, fileSystem),
+                Effect.provideService(Path.Path, path),
+                Effect.flatMap((skills) => provider.snapshotForCwd(cwd, skills)),
+                Effect.mapError(
+                  (cause) =>
+                    new ProviderDriverError({
+                      driver: DRIVER,
+                      instanceId,
+                      detail: "Could not read Antigravity workspace skills.",
+                      cause,
+                    }),
+                ),
               ),
-            ),
       orchestrationAdapter,
       textGeneration,
       auth: authFlow.controller,

@@ -4,7 +4,11 @@ import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 
-import { discoverAntigravitySkills } from "./AntigravitySkills.ts";
+import {
+  antigravityListedSkills,
+  antigravitySkillCommandText,
+  discoverAntigravitySkills,
+} from "./AntigravitySkills.ts";
 import { symlinksSupported } from "@t3tools/shared/testing/symlinks";
 
 const writeSkill = Effect.fn("writeSkill")(function* (directory: string, contents: string) {
@@ -311,4 +315,54 @@ it.layer(NodeServices.layer)("discoverAntigravitySkills", (it) => {
       }
     }),
   );
+});
+
+it.layer(NodeServices.layer)("antigravityListedSkills", (it) => {
+  it.effect("reads the skills a session lists and where each one lives", () =>
+    Effect.gen(function* () {
+      const path = yield* Path.Path;
+      const cwd = path.resolve("workspace");
+      const skill = (name: string, skillPath: string) => ({
+        name,
+        description: ` ${name} it. `,
+        _meta: { antigravity: { skill: { path: skillPath } } },
+      });
+      const projectSkill = path.join(cwd, ".agents", "skills", "deploy", "SKILL.md");
+      const userSkill = path.resolve("home", ".gemini", "config", "skills", "review", "SKILL.md");
+      const commands = [
+        { name: "plan", description: "Plan a task" },
+        skill("deploy", projectSkill),
+        skill("review", userSkill),
+        // Picker names must be trimmed, and a trimmed name is a command the agent does not know.
+        skill(" padded", projectSkill),
+      ];
+
+      assert.deepEqual(antigravityListedSkills(path, cwd, commands), [
+        {
+          name: "deploy",
+          description: "deploy it.",
+          path: projectSkill,
+          scope: "project",
+          enabled: true,
+        },
+        {
+          name: "review",
+          description: "review it.",
+          path: userSkill,
+          scope: "user",
+          enabled: true,
+        },
+      ]);
+      assert.isUndefined(antigravityListedSkills(path, cwd, commands.slice(0, 1)));
+    }),
+  );
+});
+
+it("runs a listed skill that opens the message as the agent's own command", () => {
+  const skills = [{ name: "deploy" }];
+  assert.equal(antigravitySkillCommandText("$deploy ship it", skills), "/deploy ship it");
+  assert.equal(antigravitySkillCommandText("  $deploy", skills), "/deploy");
+  assert.equal(antigravitySkillCommandText("$review this", skills), "$review this");
+  assert.equal(antigravitySkillCommandText("please $deploy", skills), "please $deploy");
+  assert.equal(antigravitySkillCommandText("$25 for deploy", skills), "$25 for deploy");
 });

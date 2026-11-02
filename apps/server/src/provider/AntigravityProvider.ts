@@ -24,6 +24,7 @@ import type * as EffectAcpSchema from "effect-acp/compat";
 
 import type * as AcpSessionRuntime from "@t3tools/provider-acp/server/AcpSessionRuntime";
 import { acpProviderOptionDescriptors } from "@t3tools/provider-acp/server/sessionConfig";
+import { isAntigravitySkillCommand } from "./Drivers/AntigravitySkills.ts";
 import { makeManagedServerProvider } from "@t3tools/provider-core/server/managedProvider";
 import {
   makeManualOnlyProviderMaintenanceCapabilities,
@@ -207,6 +208,10 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
   });
   // Preserve disk-discovered skills when callbacks replace workspace commands; the registry will not rescan them.
   const discoveredSkills = new Map<string, ServerProvider["skills"]>();
+  // What the agent loads for a workspace, which outranks T3's scan of it.
+  const listedSkills = new Map<string, ServerProvider["skills"]>();
+  const workspaceSkills = (cwd: string, published: ServerProvider["skills"] | undefined) =>
+    listedSkills.get(cwd) ?? published ?? discoveredSkills.get(cwd) ?? [];
   const thinkingLevels = new Map<string, ThinkingConfig | null>();
   const observeThinkingLevels = (
     configOptions: ReadonlyArray<EffectAcpSchema.SessionConfigOption> | null | undefined,
@@ -396,7 +401,7 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
                     cwd,
                     checkedAt: updatedAt,
                     slashCommands: workspace?.slashCommands ?? draft.slashCommands,
-                    skills: workspace?.skills ?? discoveredSkills.get(cwd) ?? [],
+                    skills: workspaceSkills(cwd, workspace?.skills),
                   },
                 ].slice(-MAX_WORKSPACE_SNAPSHOTS),
               }
@@ -421,9 +426,13 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
   const onAvailableCommands = Effect.fn("AntigravityProvider.onAvailableCommands")(function* (
     commands: ReadonlyArray<EffectAcpSchema.AvailableCommand>,
     cwd?: string,
+    /** The skills among `commands`, from runtimes that list them (`antigravityListedSkills`). */
+    listed?: ServerProvider["skills"],
   ) {
     if (!settings.enabled) return;
     const slashCommands = nativeCommands(commands);
+    // An agent that listed skills here lists none once the last one is removed.
+    if (cwd && (listed || listedSkills.has(cwd))) listedSkills.set(cwd, listed ?? []);
     const updatedAt = DateTime.formatIso(yield* DateTime.now);
     yield* SubscriptionRef.update(metadata, (state) => {
       if (state.draft.auth.status === "unauthenticated") return state;
@@ -431,7 +440,10 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
         ...state,
         draft: {
           ...state.draft,
-          slashCommands,
+          // A listed skill belongs to its session's workspace.
+          slashCommands: listed
+            ? nativeCommands(commands.filter((command) => !isAntigravitySkillCommand(command)))
+            : slashCommands,
           ...(cwd
             ? {
                 workspaceSnapshots: [
@@ -440,10 +452,10 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
                     cwd,
                     checkedAt: updatedAt,
                     slashCommands,
-                    skills:
-                      state.draft.workspaceSnapshots?.find((entry) => entry.cwd === cwd)?.skills ??
-                      discoveredSkills.get(cwd) ??
-                      [],
+                    skills: workspaceSkills(
+                      cwd,
+                      state.draft.workspaceSnapshots?.find((entry) => entry.cwd === cwd)?.skills,
+                    ),
                   },
                 ].slice(-MAX_WORKSPACE_SNAPSHOTS),
               }
@@ -481,6 +493,7 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
         }) satisfies AntigravityProviderState,
     );
     discoveredSkills.clear();
+    listedSkills.clear();
     thinkingLevels.clear();
   });
 
@@ -488,7 +501,8 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
     cwd: string,
     skills?: ServerProvider["skills"],
   ) {
-    if (skills) {
+    // A scan that started before the agent listed this workspace's skills must not replace them.
+    if (skills && !listedSkills.has(cwd)) {
       discoveredSkills.set(cwd, skills);
       yield* SubscriptionRef.update(metadata, (state) =>
         state.draft.workspaceSnapshots?.some((entry) => entry.cwd === cwd)
@@ -506,7 +520,7 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
     }
     const snapshot = yield* getSnapshot;
     const workspace = snapshot.workspaceSnapshots?.find((entry) => entry.cwd === cwd);
-    const resolvedSkills = skills ?? workspace?.skills ?? discoveredSkills.get(cwd) ?? [];
+    const resolvedSkills = workspaceSkills(cwd, skills ?? workspace?.skills);
     return workspace
       ? { ...snapshot, slashCommands: workspace.slashCommands, skills: resolvedSkills }
       : { ...snapshot, skills: resolvedSkills };
@@ -537,5 +551,6 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
     onSignedOut: clearAccountMetadata(),
     onAuthRequired: clearAccountMetadata(),
     snapshotForCwd,
+    listedSkills: (cwd: string) => listedSkills.get(cwd),
   };
 });

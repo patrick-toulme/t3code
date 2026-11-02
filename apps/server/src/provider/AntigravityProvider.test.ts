@@ -658,6 +658,53 @@ it.layer(layerTest)("Antigravity provider snapshots", (it) => {
     ),
   );
 
+  it.effect("lists the workspace skills the agent lists instead of a scan", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const harness = yield* makeHarness();
+        yield* harness.initialize;
+        const scanned = [
+          { name: "legacy", path: "/workspace/.agent/skills/legacy/SKILL.md", enabled: true },
+        ];
+        const listed = [
+          {
+            name: "deploy",
+            path: "/workspace/.agents/skills/deploy/SKILL.md",
+            scope: "project",
+            enabled: true,
+          },
+        ];
+        const listedCommands = [
+          ...commands,
+          {
+            name: "deploy",
+            description: "Ship it",
+            _meta: { antigravity: { skill: { path: listed[0]!.path } } },
+          },
+        ];
+        yield* harness.provider.snapshotForCwd("/workspace", scanned);
+        yield* harness.provider.onSessionStarted(started, "/workspace");
+        yield* harness.provider.onAvailableCommands(listedCommands, "/workspace", listed);
+        // A scan that finishes after the agent listed its skills changes nothing.
+        const workspace = yield* harness.provider.snapshotForCwd("/workspace", scanned);
+        expect(workspace.skills).toEqual(listed);
+        expect(workspace.slashCommands.map((command) => command.name)).toEqual([
+          "plan",
+          "logout",
+          "deploy",
+        ]);
+        // Another workspace does not offer this one's skills.
+        expect((yield* harness.provider.snapshot.getSnapshot).slashCommands).toEqual(
+          expectedCommands,
+        );
+
+        yield* harness.provider.onAvailableCommands(commands, "/workspace");
+        expect(harness.provider.listedSkills("/workspace")).toEqual([]);
+        expect((yield* harness.provider.snapshotForCwd("/workspace")).skills).toEqual([]);
+      }),
+    ),
+  );
+
   it.effect("bounds workspace metadata without starting sessions for workspace lookup", () =>
     Effect.scoped(
       Effect.gen(function* () {

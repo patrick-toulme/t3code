@@ -1,10 +1,13 @@
 import type { ServerProviderSkill } from "@t3tools/contracts";
+import { SKILL_MENTION_PATTERN } from "@t3tools/shared/composerInlineTokens";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
+import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import type * as PlatformError from "effect/PlatformError";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
+import type * as EffectAcpSchema from "effect-acp/compat";
 import { parse as parseYamlDocument } from "yaml";
 
 /** Match Python os.path.expanduser: USERPROFILE, then HOMEDRIVE+HOMEPATH on Windows; HOME elsewhere. */
@@ -216,3 +219,57 @@ export const discoverAntigravitySkills = Effect.fn("discoverAntigravitySkills")(
   }
   return [...skillsByName.values()].sort((left, right) => left.name.localeCompare(right.name));
 });
+
+const decodeListedSkill = Schema.decodeUnknownOption(
+  Schema.Struct({ antigravity: Schema.Struct({ skill: Schema.Struct({ path: Schema.String }) }) }),
+);
+
+/** Newer runtimes list the session's skills among its commands, each naming its SKILL.md. */
+export function isAntigravitySkillCommand(command: EffectAcpSchema.AvailableCommand): boolean {
+  return Option.isSome(decodeListedSkill(command._meta));
+}
+
+/** The skills a session listed, or `undefined` from runtimes that list none. */
+export function antigravityListedSkills(
+  path: Path.Path,
+  cwd: string | undefined,
+  commands: ReadonlyArray<EffectAcpSchema.AvailableCommand>,
+): ReadonlyArray<ServerProviderSkill> | undefined {
+  if (!commands.some(isAntigravitySkillCommand)) return undefined;
+  return commands.flatMap((command): ServerProviderSkill[] => {
+    const skillPath = Option.getOrUndefined(decodeListedSkill(command._meta))?.antigravity.skill
+      .path;
+    if (!skillPath?.trim() || !command.name || command.name !== command.name.trim()) return [];
+    const description = command.description.trim();
+    const relative = cwd === undefined ? undefined : path.relative(cwd, skillPath);
+    const inWorkspace =
+      relative !== undefined &&
+      relative !== ".." &&
+      !relative.startsWith(`..${path.sep}`) &&
+      !path.isAbsolute(relative);
+    return [
+      {
+        name: command.name,
+        ...(description ? { description } : {}),
+        path: skillPath,
+        scope: inWorkspace ? "project" : "user",
+        enabled: true,
+      },
+    ];
+  });
+}
+
+// The composer's chip rule, anchored to the message start, so `$25` never names a skill.
+const LEADING_SKILL_MENTION = new RegExp(`^\\s*${SKILL_MENTION_PATTERN.source}`, "u");
+
+/** Listed skills run for a leading `/name`, while T3 composers insert `$name`. */
+export function antigravitySkillCommandText(
+  text: string,
+  skills: ReadonlyArray<Pick<ServerProviderSkill, "name">>,
+): string {
+  const match = LEADING_SKILL_MENTION.exec(text);
+  const name = match?.[2];
+  return match !== null && skills.some((skill) => skill.name === name)
+    ? `/${name}${text.slice(match[0].length)}`
+    : text;
+}

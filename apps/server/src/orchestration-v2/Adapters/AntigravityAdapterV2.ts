@@ -4,6 +4,7 @@ import {
   ProviderInstanceId,
   type OrchestrationV2ProviderCapabilities,
   type ProviderSetupError,
+  type ServerProviderSkill,
 } from "@t3tools/contracts";
 import type { SelfInvocation } from "@t3tools/shared/nodeRuntime";
 import * as Crypto from "effect/Crypto";
@@ -13,7 +14,9 @@ import * as Path from "effect/Path";
 import * as Exit from "effect/Exit";
 import * as Semaphore from "effect/Semaphore";
 import * as Scope from "effect/Scope";
+import * as Stream from "effect/Stream";
 import * as EffectAcpErrors from "effect-acp/errors";
+import type * as EffectAcpSchema from "effect-acp/compat";
 
 import * as ProviderHost from "@t3tools/provider-core/server/ProviderHost";
 import { PULL_REQUEST_LINKING_INSTRUCTIONS } from "@t3tools/provider-core/server/runtimeInstructions";
@@ -44,6 +47,7 @@ import {
   normalizeAntigravityToolCall,
 } from "../../provider/acp/AntigravityProtocol.ts";
 import { isAntigravitySignInRequiredError } from "../../provider/antigravityAuthSupport.ts";
+import { antigravitySkillCommandText } from "../../provider/Drivers/AntigravitySkills.ts";
 import {
   AcpProviderCapabilitiesV2,
   makeAcpAdapterV2,
@@ -87,6 +91,12 @@ export interface AntigravityAdapterV2Options {
     cwd: string,
   ) => Effect.Effect<void>;
   readonly onSessionEvent?: AcpAdapterV2Flavor["onSessionEvent"];
+  readonly onAvailableCommands?: (
+    commands: ReadonlyArray<EffectAcpSchema.AvailableCommand>,
+    cwd: string,
+  ) => Effect.Effect<void>;
+  /** The skills the agent listed for a workspace; it runs them for a leading `/name`. */
+  readonly listedSkills?: (cwd: string) => ReadonlyArray<ServerProviderSkill> | undefined;
   readonly nativeLogging?: Parameters<typeof makeAcpAdapterV2>[0]["nativeLogging"];
   readonly continuationRequests?: Parameters<typeof makeAcpAdapterV2>[0]["continuationRequests"];
   /** The agent's GEMINI_HOME. Its session logs show turns that ended on an upstream error. */
@@ -157,6 +167,18 @@ export function makeAntigravityAcpAdapterFlavor(
       let projectUpdate: Parameters<typeof runtime.handleSessionUpdate>[0] | undefined;
       return {
         ...runtime,
+        // Commands carry the session's workspace skills, so report them with its cwd.
+        getEvents: () =>
+          runtime
+            .getEvents()
+            .pipe(
+              Stream.tap((event) =>
+                event._tag === "AvailableCommandsUpdated"
+                  ? (options.onAvailableCommands?.(event.availableCommands, input.cwd) ??
+                    Effect.void)
+                  : Effect.void,
+              ),
+            ),
         handleReadTextFile: (handler) =>
           runtime.handleReadTextFile((request, context) =>
             handler(request, context).pipe(
@@ -269,6 +291,13 @@ export function makeAntigravityAcpAdapterFlavor(
     },
     normalizeToolCall: normalizeAntigravityToolCall,
     extractSubagentUpdate: extractAntigravitySubagentUpdate,
+    rewriteUserText: (text, turnInput) => {
+      const cwd = turnInput.runtimePolicy.cwd;
+      const skills = cwd === null ? undefined : options.listedSkills?.(cwd);
+      return Effect.succeed(
+        skills === undefined ? text : antigravitySkillCommandText(text, skills),
+      );
+    },
     supportsImagePrompts: true,
     // ACP 1.3.0 treats /compact as ordinary model input.
     supportsCompaction: false,

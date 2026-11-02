@@ -1248,3 +1248,131 @@ describe("AntigravityAdapterV2 session system prompt", () => {
       }).pipe(Effect.provide(layerSession), Effect.scoped),
   );
 });
+
+describe("AntigravityAdapterV2 skills", () => {
+  it.effect("reports commands with their workspace and runs a listed skill natively", () =>
+    Effect.gen(function* () {
+      const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const crypto = yield* Crypto.Crypto;
+      const mockAgentPath = yield* path.fromFileUrl(
+        new URL("../../../scripts/acp-mock-agent.ts", import.meta.url),
+      );
+      type RuntimeService = AcpSessionRuntime.AcpSessionRuntime["Service"];
+      const promptReceived = yield* Deferred.make<Parameters<RuntimeService["prompt"]>[0]>();
+      const commandsReceived = yield* Deferred.make<{
+        readonly names: ReadonlyArray<string>;
+        readonly cwd: string;
+      }>();
+      const workspace = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-ag-skill-" });
+      const instanceId = ProviderInstanceId.make("antigravity-skill-test");
+      const adapter = yield* makeAntigravityAdapterV2({
+        instanceId,
+        selfInvocation: yield* resolveSelfInvocation(),
+        makeRuntime: (input) =>
+          makeAntigravityAcpRuntime({
+            ...input,
+            childProcessSpawner,
+            spawn: {
+              command: process.execPath,
+              args: [mockAgentPath],
+              cwd: input.cwd,
+              env: { T3_ACP_ANTIGRAVITY: "1", T3_ACP_HANG_PROMPT_FOREVER: "1" },
+            },
+          }).pipe(
+            Effect.provideService(Crypto.Crypto, crypto),
+            Effect.map((runtime): RuntimeService => ({
+              ...runtime,
+              prompt: (request) =>
+                Deferred.succeed(promptReceived, request).pipe(
+                  Effect.andThen(runtime.prompt(request)),
+                ),
+            })),
+          ),
+        withProcess: (_stop, task) => task,
+        // @effect-diagnostics-next-line effectSucceedWithVoid:off - This optional result requires undefined, not the wider void type.
+        defaultModel: Effect.succeed(undefined),
+        onAvailableCommands: (commands, cwd) =>
+          Deferred.succeed(commandsReceived, {
+            names: commands.map((command) => command.name),
+            cwd,
+          }).pipe(Effect.asVoid),
+        listedSkills: (cwd) =>
+          cwd === workspace
+            ? [{ name: "deploy", path: path.join(cwd, "SKILL.md"), enabled: true }]
+            : undefined,
+      });
+      const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        cwd: workspace,
+      });
+      const threadId = ThreadId.make("thread-antigravity-skill");
+      const modelSelection = { instanceId, model: "gemini-test-low" } as const;
+      const session = yield* adapter.openSession({
+        threadId,
+        providerSessionId: ProviderSessionId.make("provider-session-antigravity-skill"),
+        modelSelection,
+        runtimePolicy,
+      });
+      const providerThread = yield* session.ensureThread({
+        threadId,
+        modelSelection,
+        runtimePolicy,
+      });
+      assert.deepEqual(yield* Deferred.await(commandsReceived), {
+        names: ["plan", "logout"],
+        cwd: workspace,
+      });
+      const now = yield* DateTime.now;
+      yield* session
+        .startTurn({
+          appThread: {
+            createdBy: "user",
+            creationSource: "web",
+            id: threadId,
+            projectId: ProjectId.make("project-antigravity-skill"),
+            title: "Antigravity skill",
+            providerInstanceId: instanceId,
+            modelSelection,
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            branch: null,
+            worktreePath: null,
+            activeProviderThreadId: providerThread.id,
+            lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
+            forkedFrom: null,
+            createdAt: now,
+            updatedAt: now,
+            archivedAt: null,
+            settledOverride: null,
+            settledAt: null,
+            lastVisitedAt: null,
+            deletedAt: null,
+          },
+          threadId,
+          runId: RunId.make("run-antigravity-skill"),
+          runOrdinal: 1,
+          providerTurnOrdinal: 1,
+          attemptId: RunAttemptId.make("attempt-antigravity-skill"),
+          rootNodeId: NodeId.make("node-antigravity-skill"),
+          providerThread,
+          message: {
+            createdBy: "user",
+            creationSource: "web",
+            messageId: MessageId.make("message-antigravity-skill"),
+            text: "$deploy to staging",
+            attachments: [],
+          },
+          modelSelection,
+          runtimePolicy,
+        })
+        .pipe(Effect.forkScoped);
+      // A native command reaches the agent as written, without T3's turn instructions.
+      assert.deepEqual((yield* Deferred.await(promptReceived)).prompt, [
+        { type: "text", text: "/deploy to staging" },
+      ]);
+    }).pipe(Effect.provide(layerSession), Effect.scoped),
+  );
+});

@@ -22,6 +22,7 @@ import type * as AcpSessionRuntime from "@t3tools/provider-acp/server/AcpSession
 import {
   antigravityAppendsSystemPrompt,
   antigravityPermissionMode,
+  antigravityReportsClientToolCalls,
   antigravityRuntimeModeForSessionMode,
   applyAntigravityAcpModelSelection,
   buildAntigravityPrompt,
@@ -151,7 +152,9 @@ export function makeAntigravityAcpAdapterFlavor(
         )
         .pipe(Effect.provideService(Scope.Scope, scope));
       // Repair keeps state across updates, so each runtime must have one session-update handler.
-      const reads = makeAntigravityReadRepair();
+      // An agent that reports its own client tool calls needs none, so start drops it.
+      let reads: ReturnType<typeof makeAntigravityReadRepair> | undefined =
+        makeAntigravityReadRepair();
       // Served reads are reported from the read handler, so they take turns with agent updates.
       const updates = yield* Semaphore.make(1);
       let projectUpdate: Parameters<typeof runtime.handleSessionUpdate>[0] | undefined;
@@ -161,7 +164,7 @@ export function makeAntigravityAcpAdapterFlavor(
           runtime.handleReadTextFile((request, context) =>
             handler(request, context).pipe(
               Effect.onExit((exit) => {
-                const served = reads.attempted(request.path, Exit.isSuccess(exit));
+                const served = reads?.attempted(request.path, Exit.isSuccess(exit));
                 if (served === undefined || projectUpdate === undefined) return Effect.void;
                 return updates
                   .withPermit(
@@ -179,21 +182,28 @@ export function makeAntigravityAcpAdapterFlavor(
             ),
           ),
         prompt: (payload, promptOptions) =>
-          Effect.sync(reads.reset).pipe(Effect.andThen(runtime.prompt(payload, promptOptions))),
+          Effect.sync(() => reads?.reset()).pipe(
+            Effect.andThen(runtime.prompt(payload, promptOptions)),
+          ),
         handleSessionUpdate: (handler) => {
           projectUpdate = handler;
           return runtime.handleSessionUpdate((notification) =>
-            updates.withPermit(handler(reads.repair(notification))),
+            updates.withPermit(handler(reads?.repair(notification) ?? notification)),
           );
         },
         start: () =>
-          runtime
-            .start()
-            .pipe(
-              Effect.tap(
-                (started) => options.onSessionStarted?.(started, input.cwd) ?? Effect.void,
-              ),
+          runtime.start().pipe(
+            Effect.tap((started) =>
+              Effect.sync(() => {
+                if (
+                  antigravityReportsClientToolCalls(started.initializeResult.agentInfo?.version)
+                ) {
+                  reads = undefined;
+                }
+              }),
             ),
+            Effect.tap((started) => options.onSessionStarted?.(started, input.cwd) ?? Effect.void),
+          ),
       } satisfies typeof runtime;
     },
     Effect.provideService(Crypto.Crypto, options.crypto),

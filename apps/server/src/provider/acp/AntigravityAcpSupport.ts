@@ -83,6 +83,14 @@ export function isQualifiedAntigravityRelease(version: string | null | undefined
   return version?.trim() === "1.4.5";
 }
 
+// Must match the first agy-acp-server release with the agent changes made for T3 Code.
+const T3_CODE_CHANGES_RELEASE = [1, 4, 6] as const;
+
+function antigravityHasT3CodeChanges(version: string | null | undefined): boolean {
+  const parsed = parseAntigravityVersion(version);
+  return parsed !== undefined && compareVersions(parsed, T3_CODE_CHANGES_RELEASE) >= 0;
+}
+
 /**
  * 1.4.5 appends `systemPrompt.append` to its system instructions on new, load and resume, and
  * keeps none of it between processes, so every activation sends it again.
@@ -148,6 +156,14 @@ export const makeAntigravityAcpRuntime = Effect.fn("makeAntigravityAcpRuntime")(
   );
   return yield* Effect.service(AcpSessionRuntime.AcpSessionRuntime).pipe(Effect.provide(context));
 });
+
+/**
+ * Announces each client tool call before its file request and closes it with its own outcome,
+ * so T3 need not repair the agent's read updates.
+ */
+export function antigravityReportsClientToolCalls(version: string | null | undefined): boolean {
+  return antigravityHasT3CodeChanges(version);
+}
 
 export function antigravityPermissionMode(runtimeMode: RuntimeMode): string {
   switch (runtimeMode) {

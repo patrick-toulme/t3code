@@ -247,8 +247,8 @@ function antigravityClientReadPath(update: {
 }
 
 /**
- * The agent never completes a subagent's `client_view_file` call, then fails every open call
- * with the next unrelated step error. Report reads T3 served as completed instead.
+ * Releases before T3 Code's changes never complete a subagent's `client_view_file` call, then fail
+ * every open call with the next unrelated step error. Report reads T3 served as completed instead.
  */
 export function makeAntigravityReadRepair() {
   type Outcome = "served" | "refused";

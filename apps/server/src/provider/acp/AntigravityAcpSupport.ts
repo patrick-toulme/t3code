@@ -63,15 +63,16 @@ function compareVersions(left: ReadonlyArray<number>, right: ReadonlyArray<numbe
 }
 
 /**
- * 1.4.2 through 1.4.5 create or overwrite skills/system/run-workflow/SKILL.md in the workspace
- * unless `run_workflow` is disabled. Older builds offer the tool and leave the file alone.
+ * From 1.4.2, builds create or overwrite skills/system/run-workflow/SKILL.md in the workspace
+ * unless `run_workflow` is disabled; the release with T3 Code's changes keeps it out. Older
+ * builds offer the tool and leave the file alone.
  */
 function antigravityWritesRunWorkflowSkill(version: string | null | undefined): boolean {
   const parsed = parseAntigravityVersion(version);
   return (
     parsed !== undefined &&
     compareVersions(parsed, [1, 4, 2]) >= 0 &&
-    compareVersions(parsed, [1, 4, 5]) <= 0
+    !antigravityHasT3CodeChanges(version)
   );
 }
 
@@ -81,6 +82,14 @@ function antigravityWritesRunWorkflowSkill(version: string | null | undefined): 
  */
 export function isQualifiedAntigravityRelease(version: string | null | undefined): boolean {
   return version?.trim() === "1.4.5";
+}
+
+// Must match the first agy-acp-server release with the agent changes made for T3 Code.
+const T3_CODE_CHANGES_RELEASE = [1, 4, 6] as const;
+
+function antigravityHasT3CodeChanges(version: string | null | undefined): boolean {
+  const parsed = parseAntigravityVersion(version);
+  return parsed !== undefined && compareVersions(parsed, T3_CODE_CHANGES_RELEASE) >= 0;
 }
 
 /**

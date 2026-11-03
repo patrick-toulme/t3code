@@ -19,7 +19,7 @@ import {
   mergeToolCallState,
   parseSessionUpdateEvent,
 } from "@t3tools/provider-acp/server/runtimeModel";
-import { acpToolCallDiffPatch } from "@t3tools/provider-acp/server/adapter";
+import { acpToolCallDiffPatch, acpToolCallSnippetEdit } from "@t3tools/provider-acp/server/adapter";
 
 const isSessionNotification = Schema.is(AcpWireSchema.SessionNotification);
 
@@ -419,6 +419,54 @@ describe("Antigravity tool results", () => {
       expect(toolCall.data.content).toMatchObject([{ patch: { format: "omitted" } }]);
       expect(acpToolCallDiffPatch(toolCall.data.content)).toBeUndefined();
     }
+  });
+
+  it("places an edit applied through the client only while it awaits approval", () => {
+    const path = "/workspace/app.ts";
+    const preEdit = Array.from({ length: 12 }, (_, i) =>
+      i === 9 ? "const target = 10;" : `line ${i + 1}`,
+    ).join("\n");
+    // Releases that write through the client send client_edit_file with the native schema.
+    const edit = (status: "pending" | "in_progress") =>
+      normalizeAntigravityToolCall(
+        parseToolUpdate({
+          sessionId: "session-1",
+          update: {
+            sessionUpdate: "tool_call",
+            toolCallId: "client-edit-1",
+            title: status === "pending" ? "Run client_edit_file?" : "Running client_edit_file",
+            kind: "edit",
+            status,
+            content: [
+              { type: "diff", path, oldText: "const target = 10;", newText: "const target = 100;" },
+            ],
+            locations: [{ path, line: 10 }],
+            rawInput: {
+              TargetFile: path,
+              Instruction: "Raise the target",
+              Description: "Raise the target",
+              TargetLintErrorIds: [],
+              AllowMultiple: false,
+              TargetContent: "const target = 10;",
+              ReplacementContent: "const target = 100;",
+              StartLine: 10,
+              EndLine: 10,
+            },
+          },
+        }).toolCall,
+        () => preEdit,
+      );
+
+    expect(acpToolCallDiffPatch(edit("pending").data.content)).toBe(
+      `--- ${path}\n+++ ${path}\n@@ -10,1 +10,1 @@\n-const target = 10;\n+const target = 100;\n`,
+    );
+    // Without approval the write may already have landed, so the edit stays an unplaced snippet.
+    const running = edit("in_progress").data.content;
+    expect(acpToolCallDiffPatch(running)).toBeUndefined();
+    expect(acpToolCallSnippetEdit(running)).toEqual({
+      oldStr: "const target = 10;",
+      newStr: "const target = 100;",
+    });
   });
 
   it.each([

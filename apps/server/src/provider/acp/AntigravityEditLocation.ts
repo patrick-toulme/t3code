@@ -5,8 +5,10 @@ import { PositiveInt } from "@t3tools/contracts";
 import { FILE_HEADERS_ONLY, formatPatch, structuredPatch, type StructuredPatchHunk } from "diff";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
+import type * as EffectAcpSchema from "effect-acp/compat";
 
-const PRE_EDIT_FILE_LIMIT = 1024 * 1024;
+/** Larger files are not searched to place an edit. */
+export const ANTIGRAVITY_PRE_EDIT_FILE_LIMIT = 1024 * 1024;
 // The live preview runs synchronously. One budget covers every chunk in a call: the generic
 // ACP formatter's edit-distance limit, plus a size limit that skips diffing entirely.
 const EDIT_DIFF_BUDGET = 1_000;
@@ -65,7 +67,7 @@ const pascalKeys = (value: unknown): unknown => {
 export function readAntigravityPreEditFile(path: string): string | undefined {
   try {
     const stat = NodeFS.statSync(path);
-    return stat.isFile() && stat.size <= PRE_EDIT_FILE_LIMIT
+    return stat.isFile() && stat.size <= ANTIGRAVITY_PRE_EDIT_FILE_LIMIT
       ? NodeFS.readFileSync(path, "utf8")
       : undefined;
   } catch {
@@ -223,4 +225,114 @@ export function antigravityEditPatch(input: {
     .filter(Boolean)
     .join("\n");
   return patch || undefined;
+}
+
+// Enough for the edits in flight; an evicted entry only leaves an edit unplaced.
+const WRITTEN_EDIT_LIMIT = 16;
+
+const ReportedLines = Schema.NonEmptyArray(
+  Schema.Struct({ path: Schema.String, line: PositiveInt }),
+);
+const decodeReportedLines = Schema.decodeUnknownOption(ReportedLines);
+
+function remember<K, V>(entries: Map<K, V>, key: K, value: V | undefined) {
+  entries.delete(key);
+  if (value === undefined) return;
+  entries.set(key, value);
+  for (const oldest of entries.keys()) {
+    if (entries.size <= WRITTEN_EDIT_LIMIT) break;
+    entries.delete(oldest);
+  }
+}
+
+/**
+ * Edits T3 wrote for the agent. Only agents offered writes write through T3, and they close each
+ * finished edit with the line of every replaced occurrence in the file before the edit. The file's
+ * text from before the write shows whether each occurrence spans whole lines there.
+ */
+export function makeAntigravityWrittenEdits() {
+  const preWriteTexts = new Map<string, string>();
+  const reportedLines = new Map<string, typeof ReportedLines.Type>();
+  return {
+    /** Keeps what a file held right before T3 writes the agent's edit to it. */
+    recordWrite: (path: string, text: string | undefined) =>
+      remember(
+        preWriteTexts,
+        path,
+        text !== undefined && text.length <= ANTIGRAVITY_PRE_EDIT_FILE_LIMIT ? text : undefined,
+      ),
+    /** Keeps the lines a finished tool call reports, which the generic parse folds by path. */
+    observe: (notification: EffectAcpSchema.SessionNotification) => {
+      const update = notification.update;
+      if (update.sessionUpdate !== "tool_call_update" || update.status !== "completed") return;
+      const lines = Option.getOrUndefined(decodeReportedLines(update.locations));
+      if (lines !== undefined) remember(reportedLines, update.toolCallId, lines);
+    },
+    edit: (toolCallId: string) => {
+      const lines = reportedLines.get(toolCallId);
+      const path = lines?.[0].path;
+      const text = path === undefined ? undefined : preWriteTexts.get(path);
+      return lines === undefined || text === undefined || lines.some((line) => line.path !== path)
+        ? undefined
+        : { lines, preWriteText: text };
+    },
+  };
+}
+
+export type AntigravityWrittenEdits = ReturnType<typeof makeAntigravityWrittenEdits>;
+
+/**
+ * Places a finished edit T3 wrote at the lines the agent reports. Each diff is an occurrence's
+ * real old and new text, sent when it differs from the request.
+ */
+export function antigravityWrittenEdit(input: {
+  readonly rawInput: unknown;
+  readonly diffs: ReadonlyArray<{ readonly oldText: string; readonly newText: string }>;
+  readonly written: NonNullable<ReturnType<AntigravityWrittenEdits["edit"]>>;
+}):
+  | {
+      readonly path: string;
+      readonly oldText: string;
+      readonly newText: string;
+      readonly patch: string | typeof ANTIGRAVITY_EDIT_DIFF_OMITTED | undefined;
+    }
+  | undefined {
+  const { lines, preWriteText } = input.written;
+  const [location] = lines;
+  const requested = Option.getOrUndefined(decodeEditInput(pascalKeys(input.rawInput)));
+  const occurrences =
+    input.diffs.length === lines.length
+      ? input.diffs.map((diff, index) => ({ ...diff, line: lines[index]?.line ?? location.line }))
+      : lines.length === 1 && requested !== undefined && !("ReplacementChunks" in requested)
+        ? [
+            {
+              oldText: requested.TargetContent,
+              newText: requested.ReplacementContent,
+              line: location.line,
+            },
+          ]
+        : [];
+  const [first] = occurrences;
+  if (first === undefined) return undefined;
+  const same = occurrences.every(
+    (occurrence) => occurrence.oldText === first.oldText && occurrence.newText === first.newText,
+  );
+  return {
+    path: location.path,
+    // A repeated replacement reads as one; the patch shows each place.
+    oldText: same ? first.oldText : occurrences.map((occurrence) => occurrence.oldText).join("\n"),
+    newText: same ? first.newText : occurrences.map((occurrence) => occurrence.newText).join("\n"),
+    patch: antigravityEditPatch({
+      path: location.path,
+      rawInput: {
+        ReplacementChunks: occurrences.map((occurrence) => ({
+          TargetContent: occurrence.oldText,
+          ReplacementContent: occurrence.newText,
+          StartLine: occurrence.line,
+          EndLine: occurrence.line,
+        })),
+      },
+      readPreEditFile: () => preWriteText,
+    }),
+  };
 }

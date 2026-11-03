@@ -16,10 +16,12 @@ import {
   makeAntigravityReadRepair,
 } from "./AntigravityProtocol.ts";
 import {
+  type AcpToolCallState,
   mergeToolCallState,
   parseSessionUpdateEvent,
 } from "@t3tools/provider-acp/server/runtimeModel";
 import { acpToolCallDiffPatch, acpToolCallSnippetEdit } from "@t3tools/provider-acp/server/adapter";
+import { makeAntigravityWrittenEdits } from "./AntigravityEditLocation.ts";
 
 const isSessionNotification = Schema.is(AcpWireSchema.SessionNotification);
 
@@ -421,13 +423,24 @@ describe("Antigravity tool results", () => {
     }
   });
 
-  it("places an edit applied through the client only while it awaits approval", () => {
+  describe("edits written through the client", () => {
     const path = "/workspace/app.ts";
     const preEdit = Array.from({ length: 12 }, (_, i) =>
       i === 9 ? "const target = 10;" : `line ${i + 1}`,
     ).join("\n");
+    const raise = {
+      TargetContent: "const target = 10;",
+      ReplacementContent: "const target = 100;",
+    };
     // Releases that write through the client send client_edit_file with the native schema.
-    const edit = (status: "pending" | "in_progress") =>
+    const announce = (
+      status: "pending" | "in_progress",
+      chunk: { readonly TargetContent: string; readonly ReplacementContent: string } = raise,
+      range: { readonly StartLine: number; readonly EndLine: number } = {
+        StartLine: 10,
+        EndLine: 10,
+      },
+    ) =>
       normalizeAntigravityToolCall(
         parseToolUpdate({
           sessionId: "session-1",
@@ -438,34 +451,143 @@ describe("Antigravity tool results", () => {
             kind: "edit",
             status,
             content: [
-              { type: "diff", path, oldText: "const target = 10;", newText: "const target = 100;" },
+              {
+                type: "diff",
+                path,
+                oldText: chunk.TargetContent,
+                newText: chunk.ReplacementContent,
+              },
             ],
-            locations: [{ path, line: 10 }],
+            locations: [{ path, line: range.StartLine }],
             rawInput: {
               TargetFile: path,
-              Instruction: "Raise the target",
-              Description: "Raise the target",
+              Instruction: "Edit",
+              Description: "Edit",
               TargetLintErrorIds: [],
               AllowMultiple: false,
-              TargetContent: "const target = 10;",
-              ReplacementContent: "const target = 100;",
-              StartLine: 10,
-              EndLine: 10,
+              ...chunk,
+              ...range,
             },
           },
         }).toolCall,
         () => preEdit,
       );
+    // The agent closes a finished edit with the line of each replaced occurrence, and with the
+    // real old and new text when they differ from the request.
+    const finish = (
+      announced: AcpToolCallState,
+      preWrite: string | undefined,
+      lines: ReadonlyArray<number>,
+      diffs?: ReadonlyArray<readonly [oldText: string, newText: string]>,
+    ) => {
+      const writtenEdits = makeAntigravityWrittenEdits();
+      if (preWrite !== undefined) writtenEdits.recordWrite(path, preWrite);
+      const finished = {
+        sessionId: "session-1",
+        update: {
+          sessionUpdate: "tool_call_update",
+          toolCallId: "client-edit-1",
+          status: "completed",
+          locations: lines.map((line) => ({ path, line })),
+          ...(diffs === undefined
+            ? {}
+            : {
+                content: diffs.map(([oldText, newText]) => ({
+                  type: "diff" as const,
+                  path,
+                  oldText,
+                  newText,
+                  _meta: { kind: "modify" },
+                })),
+              }),
+        },
+      } satisfies EffectAcpSchema.SessionNotification;
+      writtenEdits.observe(finished);
+      return normalizeAntigravityToolCall(
+        mergeToolCallState(announced, parseToolUpdate(finished).toolCall),
+        () => undefined,
+        writtenEdits,
+      ).data.content;
+    };
 
-    expect(acpToolCallDiffPatch(edit("pending").data.content)).toBe(
-      `--- ${path}\n+++ ${path}\n@@ -10,1 +10,1 @@\n-const target = 10;\n+const target = 100;\n`,
-    );
-    // Without approval the write may already have landed, so the edit stays an unplaced snippet.
-    const running = edit("in_progress").data.content;
-    expect(acpToolCallDiffPatch(running)).toBeUndefined();
-    expect(acpToolCallSnippetEdit(running)).toEqual({
-      oldStr: "const target = 10;",
-      newStr: "const target = 100;",
+    it("places a call awaiting approval from the unchanged file", () => {
+      expect(acpToolCallDiffPatch(announce("pending").data.content)).toBe(
+        `--- ${path}\n+++ ${path}\n@@ -10,1 +10,1 @@\n-const target = 10;\n+const target = 100;\n`,
+      );
+      // Without approval the write may already have landed, so the edit waits to be placed.
+      const running = announce("in_progress").data.content;
+      expect(acpToolCallDiffPatch(running)).toBeUndefined();
+      expect(acpToolCallSnippetEdit(running)).toEqual({
+        oldStr: "const target = 10;",
+        newStr: "const target = 100;",
+      });
+    });
+
+    it("places a finished edit T3 wrote at the lines the agent reports", () => {
+      // The target was outside the requested range, and the agent found it once in the file.
+      const outsideRange = announce("in_progress", raise, { StartLine: 1, EndLine: 2 });
+      expect(finish(outsideRange, preEdit, [10])).toEqual([
+        expect.objectContaining({
+          patch: {
+            text: `--- ${path}\n+++ ${path}\n@@ -10,1 +10,1 @@\n-const target = 10;\n+const target = 100;\n`,
+          },
+        }),
+      ]);
+
+      const twice = { TargetContent: "dup = 1", ReplacementContent: "twin = 1" };
+      const repeated = finish(
+        announce("in_progress", twice),
+        "a\ndup = 1\nb\ndup = 1\n",
+        [2, 4],
+        [
+          ["dup = 1", "twin = 1"],
+          ["dup = 1", "twin = 1"],
+        ],
+      );
+      expect(repeated).toHaveLength(1);
+      expect(acpToolCallDiffPatch(repeated)).toBe(
+        `--- ${path}\n+++ ${path}\n@@ -2,1 +2,1 @@\n-dup = 1\n+twin = 1\n@@ -4,1 +4,1 @@\n-dup = 1\n+twin = 1\n`,
+      );
+
+      const lf = { TargetContent: "beta\ngamma", ReplacementContent: "BETA\nGAMMA\nDELTA" };
+      const crlf = finish(
+        announce("in_progress", lf),
+        "alpha\r\nbeta\r\ngamma\r\n",
+        [2],
+        [["beta\r\ngamma", "BETA\r\nGAMMA\r\nDELTA"]],
+      );
+      expect(acpToolCallDiffPatch(crlf)).toBe(
+        `--- ${path}\n+++ ${path}\n@@ -2,2 +2,3 @@\n-beta\n-gamma\n+BETA\n+GAMMA\n+DELTA\n`,
+      );
+    });
+
+    it("keeps a finished edit unplaced unless T3 wrote it and the lines hold it whole", () => {
+      // T3 serves writes only to releases that report where an edit landed.
+      const unwritten = finish(announce("in_progress"), undefined, [10]);
+      expect(acpToolCallDiffPatch(unwritten)).toBeUndefined();
+      expect(acpToolCallSnippetEdit(unwritten)).toEqual({
+        oldStr: "const target = 10;",
+        newStr: "const target = 100;",
+      });
+
+      const partial = { TargetContent: "dup", ReplacementContent: "twin" };
+      const midLine = finish(
+        announce("in_progress", partial),
+        "total = dup + dup\n",
+        [1, 1],
+        [
+          ["dup", "twin"],
+          ["dup", "twin"],
+        ],
+      );
+      expect(acpToolCallDiffPatch(midLine)).toBeUndefined();
+      expect(acpToolCallSnippetEdit(midLine)).toEqual({ oldStr: "dup", newStr: "twin" });
+
+      // A call placed while awaiting approval keeps its hunk.
+      const approved = finish(announce("pending"), "changed since approval\n", [10]);
+      expect(acpToolCallDiffPatch(approved)).toBe(
+        `--- ${path}\n+++ ${path}\n@@ -10,1 +10,1 @@\n-const target = 10;\n+const target = 100;\n`,
+      );
     });
   });
 

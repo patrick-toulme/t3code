@@ -6,8 +6,19 @@ import * as Stream from "effect/Stream";
 import * as EffectAcpErrors from "effect-acp/errors";
 import type * as EffectAcpSchema from "effect-acp/compat";
 
+import { ANTIGRAVITY_PRE_EDIT_FILE_LIMIT } from "./AntigravityEditLocation.ts";
+
 const CLIENT_FILE_MAX_BYTES = 8 * 1024 * 1024;
 const UTF8_BOM = Buffer.from([0xef, 0xbb, 0xbf]);
+
+/** Like the read path: no byte order mark, and nothing for bytes that are not UTF-8. */
+function decodeUtf8Text(bytes: Uint8Array): string | undefined {
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    return undefined;
+  }
+}
 
 function isInsideRoot(path: Path.Path, root: string, candidate: string): boolean {
   const relative = path.relative(root, candidate);
@@ -119,15 +130,25 @@ export const writeAntigravityClientTextFile = Effect.fn("AntigravityClientFiles.
     readonly path: Path.Path;
     readonly allowedRoots: ReadonlyArray<string>;
     readonly request: EffectAcpSchema.WriteTextFileRequest;
+    /** Receives the file's text from before the write, if it is small enough to place an edit. */
+    readonly recordPreviousText?: (path: string, text: string | undefined) => void;
   }): Effect.fn.Return<EffectAcpSchema.WriteTextFileResponse, EffectAcpErrors.AcpError> {
     const filePath = yield* resolveClientFilePath({ ...input, requestPath: input.request.path });
-    // Reads drop a UTF-8 byte order mark, so rewriting a file that had one keeps it.
-    const head = yield* input.fileSystem.stream(filePath, { bytesToRead: 3 }).pipe(
-      Stream.runCollect,
-      Effect.map((chunks) => Buffer.concat(chunks)),
-      Effect.orElseSucceed(() => Buffer.alloc(0)),
+    const previous = yield* input.fileSystem
+      .stream(filePath, { bytesToRead: ANTIGRAVITY_PRE_EDIT_FILE_LIMIT + 1 })
+      .pipe(
+        Stream.runCollect,
+        Effect.map((chunks) => Buffer.concat(chunks)),
+        Effect.orElseSucceed(() => Buffer.alloc(0)),
+      );
+    input.recordPreviousText?.(
+      input.request.path,
+      previous.length > ANTIGRAVITY_PRE_EDIT_FILE_LIMIT ? undefined : decodeUtf8Text(previous),
     );
-    const keepsBom = head.equals(UTF8_BOM) && !input.request.content.startsWith("\uFEFF");
+    // Reads drop a UTF-8 byte order mark, so rewriting a file that had one keeps it.
+    const keepsBom =
+      previous.subarray(0, UTF8_BOM.length).equals(UTF8_BOM) &&
+      !input.request.content.startsWith("\uFEFF");
     yield* input.fileSystem.makeDirectory(input.path.dirname(filePath), { recursive: true }).pipe(
       Effect.andThen(
         input.fileSystem.writeFileString(

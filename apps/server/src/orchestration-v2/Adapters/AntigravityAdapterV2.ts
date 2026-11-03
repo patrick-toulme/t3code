@@ -36,6 +36,10 @@ import {
   readAntigravityClientTextFile,
   writeAntigravityClientTextFile,
 } from "../../provider/acp/AntigravityClientFiles.ts";
+import {
+  makeAntigravityWrittenEdits,
+  readAntigravityPreEditFile,
+} from "../../provider/acp/AntigravityEditLocation.ts";
 import { watchAntigravityPromptOutcome } from "../../provider/acp/AntigravityTurnOutcome.ts";
 import {
   antigravityApprovalOptions,
@@ -139,6 +143,8 @@ export function makeAntigravityAcpAdapterFlavor(
   const { profileDirectory } = options;
   const antigravityClientFileRoots = (cwd: string | null) =>
     cwd === null ? [options.host.paths.attachmentsDir] : [cwd, options.host.paths.attachmentsDir];
+  // A finished edit's update arrives after T3 wrote it, so T3 keeps what the file held.
+  const writtenEdits = makeAntigravityWrittenEdits();
   const makeRuntime = Effect.fn("AntigravityAdapterV2.makeRuntime")(
     function* (input: AcpAdapterV2RuntimeInput) {
       const scope = yield* Scope.fork(yield* Effect.scope);
@@ -268,6 +274,7 @@ export function makeAntigravityAcpAdapterFlavor(
           path: options.path,
           allowedRoots: antigravityClientFileRoots(cwd),
           request,
+          recordPreviousText: writtenEdits.recordWrite,
         }),
     },
     approvalOptions: antigravityApprovalOptions,
@@ -279,7 +286,12 @@ export function makeAntigravityAcpAdapterFlavor(
         respond: (answers) => makeAntigravityUserInputResponse(request, answers),
       };
     },
-    normalizeToolCall: normalizeAntigravityToolCall,
+    normalizeSessionUpdate: (notification) => {
+      writtenEdits.observe(notification);
+      return notification;
+    },
+    normalizeToolCall: (toolCall) =>
+      normalizeAntigravityToolCall(toolCall, readAntigravityPreEditFile, writtenEdits),
     extractSubagentUpdate: extractAntigravitySubagentUpdate,
     supportsImagePrompts: true,
     // ACP 1.3.0 treats /compact as ordinary model input.

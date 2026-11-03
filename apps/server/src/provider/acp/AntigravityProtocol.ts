@@ -15,6 +15,8 @@ import type { AcpToolCallState } from "@t3tools/provider-acp/server/runtimeModel
 import {
   ANTIGRAVITY_EDIT_DIFF_OMITTED,
   antigravityEditPatch,
+  antigravityWrittenEdit,
+  type AntigravityWrittenEdits,
   isAntigravitySnippetPatch,
   readAntigravityPreEditFile,
 } from "./AntigravityEditLocation.ts";
@@ -368,6 +370,13 @@ function hasTruncatedText(value: unknown): boolean {
   return Predicate.isObject(value) && Object.values(value).some(hasTruncatedText);
 }
 
+// A truncated patch would no longer parse, and bare snippets would render at line 1.
+function editPatchField(text: string | typeof ANTIGRAVITY_EDIT_DIFF_OMITTED) {
+  if (text === ANTIGRAVITY_EDIT_DIFF_OMITTED || text.length > TOOL_TEXT_LIMIT)
+    return { format: "omitted" };
+  return isAntigravitySnippetPatch(text) ? { format: "snippet", text } : { text };
+}
+
 /** The ACP adapter renders a diff's `patch.text` ahead of its bare old/new snippets. */
 function withAntigravityEditPatches(
   content: ReadonlyArray<unknown>,
@@ -397,23 +406,47 @@ function withAntigravityEditPatches(
       locations: data.locations,
       readPreEditFile,
     });
-    // A truncated patch would no longer parse, and bare snippets would render at line 1.
-    if (
-      text === ANTIGRAVITY_EDIT_DIFF_OMITTED ||
-      (text !== undefined && text.length > TOOL_TEXT_LIMIT)
-    )
-      return { ...entry, patch: { format: "omitted" } };
-    if (text === undefined) return entry;
-    return {
-      ...entry,
-      patch: isAntigravitySnippetPatch(text) ? { format: "snippet", text } : { text },
-    };
+    return text === undefined ? entry : { ...entry, patch: editPatchField(text) };
   });
+}
+
+/**
+ * A finished edit T3 wrote, placed where the agent reports it landed. Edits T3 did not write keep
+ * their earlier patch.
+ */
+function writtenEditContent(
+  content: ReadonlyArray<unknown>,
+  data: Record<string, unknown>,
+  written: NonNullable<ReturnType<AntigravityWrittenEdits["edit"]>>,
+) {
+  const diffs = content.flatMap((entry) =>
+    Predicate.isObject(entry) &&
+    entry.type === "diff" &&
+    typeof entry.oldText === "string" &&
+    typeof entry.newText === "string"
+      ? [{ oldText: entry.oldText, newText: entry.newText }]
+      : [],
+  );
+  if (
+    [data.rawInput, ...diffs.flatMap((diff) => [diff.oldText, diff.newText])].some(hasTruncatedText)
+  )
+    return undefined;
+  const edit = antigravityWrittenEdit({ rawInput: data.rawInput, diffs, written });
+  if (edit?.patch === undefined) return undefined;
+  const patch = editPatchField(edit.patch);
+  // The agent's diffs of the real change carry no patch; one made earlier stays unless this one
+  // is placed.
+  const earlierPatch = content.some(
+    (entry) => Predicate.isObject(entry) && entry.patch !== undefined,
+  );
+  if (earlierPatch && "format" in patch) return undefined;
+  return [{ type: "diff", path: edit.path, oldText: edit.oldText, newText: edit.newText, patch }];
 }
 
 export function normalizeAntigravityToolCall(
   toolCall: AcpToolCallState,
   readPreEditFile = readAntigravityPreEditFile,
+  writtenEdits?: AntigravityWrittenEdits,
 ): AcpToolCallState {
   const input = Option.getOrUndefined(decodeNativeToolFields(toolCall.data.rawInput));
   const output = Option.getOrUndefined(decodeNativeToolFields(toolCall.data.rawOutput));
@@ -448,14 +481,19 @@ export function normalizeAntigravityToolCall(
   if (imagePath !== undefined) data.imagePath = imagePath;
   if (kind === "edit") {
     const content = Array.isArray(data.content) ? data.content : [];
+    const written =
+      toolCall.status === "completed" ? writtenEdits?.edit(toolCall.toolCallId) : undefined;
+    const placed = written === undefined ? undefined : writtenEditContent(content, data, written);
     // Full-access edits report only a path; without a hunk the checkpoint diff is the review.
-    data.content = content.some((entry) => Predicate.isObject(entry) && entry.type === "diff")
-      ? withAntigravityEditPatches(
-          content,
-          data,
-          toolCall.status === "pending" ? readPreEditFile : undefined,
-        )
-      : [...content, { type: "diff", patch: { format: "omitted" } }];
+    data.content =
+      placed ??
+      (content.some((entry) => Predicate.isObject(entry) && entry.type === "diff")
+        ? withAntigravityEditPatches(
+            content,
+            data,
+            toolCall.status === "pending" ? readPreEditFile : undefined,
+          )
+        : [...content, { type: "diff", patch: { format: "omitted" } }]);
   }
   if (kind === "execute") {
     data.item = {

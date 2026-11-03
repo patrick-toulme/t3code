@@ -32,6 +32,12 @@ import * as TestProviderHost from "@t3tools/provider-testing/TestProviderHost";
 import type * as AcpSessionRuntime from "@t3tools/provider-acp/server/AcpSessionRuntime";
 import { makeAntigravityAcpRuntime } from "../../provider/acp/AntigravityAcpSupport.ts";
 import { normalizeAntigravitySessionUpdate } from "../../provider/acp/AntigravityProtocol.ts";
+import { acpToolCallDiffPatch } from "@t3tools/provider-acp/server/adapter";
+import {
+  type AcpToolCallState,
+  mergeToolCallState,
+  parseSessionUpdateEvent,
+} from "@t3tools/provider-acp/server/runtimeModel";
 import { ANTIGRAVITY_SIGN_IN_REQUIRED_MESSAGE } from "../../provider/antigravityAuthSupport.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
@@ -544,6 +550,91 @@ describe("AntigravityAdapterV2 client file writes", () => {
       assert.equal(yield* fileSystem.exists(probePath), offered);
       if (offered) assert.equal(yield* fileSystem.readFileString(probePath), "probe");
     }).pipe(Effect.provide(layerSession), Effect.scoped),
+  );
+
+  it.effect("places a finished edit it wrote at the line the agent reports", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const workspace = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "t3-antigravity-placed-",
+      });
+      const writing = makeAntigravityAcpAdapterFlavor({
+        instanceId: ProviderInstanceId.make("antigravity-placement-test"),
+        crypto: undefined as never,
+        fileSystem,
+        path,
+        host: { paths: { attachmentsDir: workspace } } as never,
+        selfInvocation: undefined as never,
+        makeRuntime: () => Effect.die("not spawned in this test"),
+        withProcess: (_stop, task) => task,
+        // @effect-diagnostics-next-line effectSucceedWithVoid:off - This optional result requires undefined, not the wider void type.
+        defaultModel: Effect.succeed(undefined),
+      });
+      const lines = Array.from({ length: 12 }, (_, i) => `line ${i + 1}`);
+      const before = lines.with(9, "const target = 10;").join("\n");
+      const after = lines.with(9, "const target = 100;").join("\n");
+      const edited = path.join(workspace, "edited.ts");
+      const untouched = path.join(workspace, "untouched.ts");
+      yield* fileSystem.writeFileString(edited, before);
+      yield* fileSystem.writeFileString(untouched, before);
+      // Full access: the call runs without approval, and its range misses the target.
+      const runEdit = (target: string) =>
+        [
+          {
+            sessionUpdate: "tool_call",
+            toolCallId: target,
+            title: "Running client_edit_file",
+            kind: "edit",
+            status: "in_progress",
+            content: [
+              {
+                type: "diff",
+                path: target,
+                oldText: "const target = 10;",
+                newText: "const target = 100;",
+              },
+            ],
+            locations: [{ path: target, line: 1 }],
+            rawInput: {
+              TargetFile: target,
+              TargetContent: "const target = 10;",
+              ReplacementContent: "const target = 100;",
+              StartLine: 1,
+              EndLine: 2,
+            },
+          },
+          {
+            sessionUpdate: "tool_call_update",
+            toolCallId: target,
+            status: "completed",
+            locations: [{ path: target, line: 10 }],
+          },
+        ] satisfies ReadonlyArray<EffectAcpSchema.SessionUpdate>;
+      const project = (target: string) => {
+        let toolCall: AcpToolCallState | undefined;
+        for (const update of runEdit(target)) {
+          const notification = writing.normalizeSessionUpdate?.(
+            normalizeAntigravitySessionUpdate({ sessionId: "mock-session-1", update }),
+          );
+          const parsed = parseSessionUpdateEvent(notification!).events[0];
+          if (parsed?._tag !== "ToolCallUpdated") return undefined;
+          toolCall = writing.normalizeToolCall?.(mergeToolCallState(toolCall, parsed.toolCall));
+        }
+        return toolCall?.data.content;
+      };
+      yield* writing.clientFileSystem!.writeTextFile!(
+        { sessionId: "mock-session-1", path: edited, content: after },
+        workspace,
+      );
+
+      assert.equal(
+        acpToolCallDiffPatch(project(edited)),
+        `--- ${edited}\n+++ ${edited}\n@@ -10,1 +10,1 @@\n-const target = 10;\n+const target = 100;\n`,
+      );
+      // An edit T3 did not write keeps the snippet it was announced with.
+      assert.isUndefined(acpToolCallDiffPatch(project(untouched)));
+    }).pipe(Effect.provide(NodeServices.layer), Effect.scoped),
   );
 
   it.effect("confines writes to the workspace and keeps a file's byte order mark", () =>

@@ -32,7 +32,10 @@ import {
   antigravitySubagentLaunches,
   describeAntigravitySubagentLaunches,
 } from "../../provider/acp/AntigravityChildWork.ts";
-import { readAntigravityClientTextFile } from "../../provider/acp/AntigravityClientFiles.ts";
+import {
+  readAntigravityClientTextFile,
+  writeAntigravityClientTextFile,
+} from "../../provider/acp/AntigravityClientFiles.ts";
 import { watchAntigravityPromptOutcome } from "../../provider/acp/AntigravityTurnOutcome.ts";
 import {
   antigravityApprovalOptions,
@@ -145,6 +148,7 @@ export function makeAntigravityAcpAdapterFlavor(
           options.makeRuntime({
             ...input,
             clientFileReads: true,
+            clientFileWrites: true,
             sessionSystemPromptAppend: PULL_REQUEST_LINKING_INSTRUCTIONS,
             additionalDirectories: [options.host.paths.attachmentsDir],
           }),
@@ -252,6 +256,14 @@ export function makeAntigravityAcpAdapterFlavor(
     clientFileSystem: {
       readTextFile: (request, cwd) =>
         readAntigravityClientTextFile({
+          fileSystem: options.fileSystem,
+          path: options.path,
+          allowedRoots: antigravityClientFileRoots(cwd),
+          request,
+        }),
+      // Only runtimes whose client edits keep diff edits register this (makeAntigravityAcpRuntime).
+      writeTextFile: (request, cwd) =>
+        writeAntigravityClientTextFile({
           fileSystem: options.fileSystem,
           path: options.path,
           allowedRoots: antigravityClientFileRoots(cwd),

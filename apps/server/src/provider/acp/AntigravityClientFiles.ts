@@ -2,10 +2,12 @@ import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import type * as FileSystem from "effect/FileSystem";
 import type * as Path from "effect/Path";
+import * as Stream from "effect/Stream";
 import * as EffectAcpErrors from "effect-acp/errors";
 import type * as EffectAcpSchema from "effect-acp/compat";
 
 const CLIENT_FILE_MAX_BYTES = 8 * 1024 * 1024;
+const UTF8_BOM = Buffer.from([0xef, 0xbb, 0xbf]);
 
 function isInsideRoot(path: Path.Path, root: string, candidate: string): boolean {
   const relative = path.relative(root, candidate);
@@ -107,5 +109,36 @@ export const readAntigravityClientTextFile = Effect.fn("AntigravityClientFiles.r
     const start = Math.max(0, (line ?? 1) - 1);
     const end = limit === undefined ? lines.length : Math.min(lines.length, start + limit);
     return { content: lines.slice(start, end).join("\n") };
+  },
+);
+
+/** The agent's session mode decides whether a write needs approval; this checks only containment. */
+export const writeAntigravityClientTextFile = Effect.fn("AntigravityClientFiles.writeTextFile")(
+  function* (input: {
+    readonly fileSystem: FileSystem.FileSystem;
+    readonly path: Path.Path;
+    readonly allowedRoots: ReadonlyArray<string>;
+    readonly request: EffectAcpSchema.WriteTextFileRequest;
+  }): Effect.fn.Return<EffectAcpSchema.WriteTextFileResponse, EffectAcpErrors.AcpError> {
+    const filePath = yield* resolveClientFilePath({ ...input, requestPath: input.request.path });
+    // Reads drop a UTF-8 byte order mark, so rewriting a file that had one keeps it.
+    const head = yield* input.fileSystem.stream(filePath, { bytesToRead: 3 }).pipe(
+      Stream.runCollect,
+      Effect.map((chunks) => Buffer.concat(chunks)),
+      Effect.orElseSucceed(() => Buffer.alloc(0)),
+    );
+    const keepsBom = head.equals(UTF8_BOM) && !input.request.content.startsWith("\uFEFF");
+    yield* input.fileSystem.makeDirectory(input.path.dirname(filePath), { recursive: true }).pipe(
+      Effect.andThen(
+        input.fileSystem.writeFileString(
+          filePath,
+          keepsBom ? `\uFEFF${input.request.content}` : input.request.content,
+        ),
+      ),
+      Effect.mapError(() =>
+        EffectAcpErrors.AcpRequestError.internalError(`Could not write '${input.request.path}'.`),
+      ),
+    );
+    return {};
   },
 );

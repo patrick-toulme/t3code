@@ -255,7 +255,6 @@ describe("AntigravityAdapterV2 client file system", () => {
       type RuntimeService = AcpSessionRuntime.AcpSessionRuntime["Service"];
       // effect-acp keeps the last handler registered per method; so does this.
       let readTextFile: Parameters<RuntimeService["handleReadTextFile"]>[0] | undefined;
-      let writeTextFile: Parameters<RuntimeService["handleWriteTextFile"]>[0] | undefined;
       const logs = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-antigravity-log-" });
       const requestLog = path.join(logs, "requests.ndjson");
       const crypto = yield* Crypto.Crypto;
@@ -281,10 +280,6 @@ describe("AntigravityAdapterV2 client file system", () => {
                 Effect.sync(() => {
                   readTextFile = handler;
                 }).pipe(Effect.andThen(runtime.handleReadTextFile(handler))),
-              handleWriteTextFile: (handler) =>
-                Effect.sync(() => {
-                  writeTextFile = handler;
-                }).pipe(Effect.andThen(runtime.handleWriteTextFile(handler))),
             })),
           ),
         withProcess: (_stop, task) => task,
@@ -332,7 +327,6 @@ describe("AntigravityAdapterV2 client file system", () => {
         writeTextFile: false,
       });
       assert.equal(initialize?.params?.clientInfo?.name, "zed");
-      assert.isUndefined(writeTextFile);
       if (readTextFile === undefined) {
         return yield* Effect.die("Antigravity sessions must serve client file reads");
       }
@@ -385,6 +379,229 @@ describe("AntigravityAdapterV2 client file system", () => {
         context("fs/read_text_file"),
       );
       assert.equal(viaInsideLink.content, "inside");
+    }).pipe(Effect.provide(layerSession), Effect.scoped),
+  );
+});
+
+describe("AntigravityAdapterV2 client file writes", () => {
+  const openWriteSession = Effect.fn("AntigravityAdapterV2Test.openWriteSession")(function* (
+    runtimeVersion: string | undefined,
+    workspace: string,
+    environment: Record<string, string> = {},
+  ) {
+    const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+    const fileSystem = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const crypto = yield* Crypto.Crypto;
+    const mockAgentPath = yield* path.fromFileUrl(
+      new URL("../../../scripts/acp-mock-agent.ts", import.meta.url),
+    );
+    type RuntimeService = AcpSessionRuntime.AcpSessionRuntime["Service"];
+    let writeTextFile: Parameters<RuntimeService["handleWriteTextFile"]>[0] | undefined;
+    const logs = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-antigravity-log-" });
+    const requestLog = path.join(logs, "requests.ndjson");
+    const instanceId = ProviderInstanceId.make("antigravity-writes-test");
+    const adapter = yield* makeAntigravityAdapterV2({
+      instanceId,
+      selfInvocation: yield* resolveSelfInvocation(),
+      makeRuntime: (input) =>
+        makeAntigravityAcpRuntime({
+          ...input,
+          ...(runtimeVersion === undefined ? {} : { runtimeVersion }),
+          childProcessSpawner,
+          spawn: {
+            command: process.execPath,
+            args: [mockAgentPath],
+            cwd: input.cwd,
+            env: { T3_ACP_ANTIGRAVITY: "1", T3_ACP_REQUEST_LOG_PATH: requestLog, ...environment },
+          },
+        }).pipe(
+          Effect.provideService(Crypto.Crypto, crypto),
+          Effect.map((runtime): RuntimeService => ({
+            ...runtime,
+            // Sees only a handler the runtime registers with the agent.
+            handleWriteTextFile: (handler) =>
+              runtime
+                .handleWriteTextFile(handler)
+                .pipe(Effect.andThen(Effect.sync(() => (writeTextFile = handler)))),
+          })),
+        ),
+      withProcess: (_stop, task) => task,
+      // @effect-diagnostics-next-line effectSucceedWithVoid:off - This optional result requires undefined, not the wider void type.
+      defaultModel: Effect.succeed(undefined),
+    });
+    const threadId = ThreadId.make("thread-antigravity-writes");
+    const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      cwd: workspace,
+    });
+    const modelSelection = { instanceId, model: "gemini-test-low" } as const;
+    const session = yield* adapter.openSession({
+      threadId,
+      providerSessionId: ProviderSessionId.make("provider-session-antigravity-writes"),
+      modelSelection,
+      runtimePolicy,
+    });
+    const providerThread = yield* session.ensureThread({ threadId, modelSelection, runtimePolicy });
+    const offered = (yield* fileSystem.readFileString(requestLog))
+      .trim()
+      .split("\n")
+      .map(
+        (line) =>
+          JSON.parse(line) as {
+            method?: string;
+            params?: { clientCapabilities?: { fs?: { writeTextFile?: boolean } } };
+          },
+      )
+      .find((request) => request.method === "initialize")?.params?.clientCapabilities
+      ?.fs?.writeTextFile;
+    return {
+      offered,
+      writeTextFile,
+      runTurn: Effect.gen(function* () {
+        const now = yield* DateTime.now;
+        yield* session.startTurn({
+          appThread: {
+            createdBy: "user",
+            creationSource: "web",
+            id: threadId,
+            projectId: ProjectId.make("project-antigravity-writes"),
+            title: "Antigravity writes",
+            providerInstanceId: instanceId,
+            modelSelection,
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            branch: null,
+            worktreePath: workspace,
+            activeProviderThreadId: providerThread.id,
+            lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
+            forkedFrom: null,
+            createdAt: now,
+            updatedAt: now,
+            archivedAt: null,
+            settledOverride: null,
+            settledAt: null,
+            lastVisitedAt: null,
+            deletedAt: null,
+          },
+          threadId,
+          runId: RunId.make("run-antigravity-writes"),
+          runOrdinal: 1,
+          providerTurnOrdinal: 1,
+          attemptId: RunAttemptId.make("attempt-antigravity-writes"),
+          rootNodeId: NodeId.make("node-antigravity-writes"),
+          providerThread,
+          message: {
+            createdBy: "user",
+            creationSource: "web",
+            messageId: MessageId.make("message-antigravity-writes"),
+            text: "edit the file",
+            attachments: [],
+          },
+          modelSelection,
+          runtimePolicy,
+        });
+        yield* session.events.pipe(
+          Stream.takeUntil((event) => event.type === "turn.terminal"),
+          Stream.runDrain,
+        );
+      }),
+    };
+  });
+
+  it.effect.each([
+    { runtimeVersion: undefined, offered: false },
+    { runtimeVersion: "1.4.5", offered: false },
+    { runtimeVersion: "1.4.6", offered: true },
+  ])("$runtimeVersion: offers and serves agent writes: $offered", ({ runtimeVersion, offered }) =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const workspace = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "t3-antigravity-writes-",
+      });
+      const probePath = path.join(workspace, "edited.ts");
+      const probeLogPath = path.join(workspace, "fs-probe.jsonl");
+      const session = yield* openWriteSession(runtimeVersion, workspace, {
+        T3_ACP_CLIENT_FS_PROBE_PATH: probePath,
+        T3_ACP_CLIENT_FS_PROBE_LOG_PATH: probeLogPath,
+      });
+      yield* session.runTurn;
+
+      assert.equal(session.offered, offered);
+      const write = (yield* fileSystem.readFileString(probeLogPath))
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line) as { method: string; result?: unknown; errorCode?: number })
+        .find((outcome) => outcome.method === "fs/write_text_file");
+      assert.deepEqual(
+        write,
+        offered
+          ? { method: "fs/write_text_file", result: {} }
+          : { method: "fs/write_text_file", errorCode: -32601 },
+      );
+      assert.equal(yield* fileSystem.exists(probePath), offered);
+      if (offered) assert.equal(yield* fileSystem.readFileString(probePath), "probe");
+    }).pipe(Effect.provide(layerSession), Effect.scoped),
+  );
+
+  it.effect("confines writes to the workspace and keeps a file's byte order mark", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const workspace = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "t3-antigravity-writes-",
+      });
+      const outside = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "t3-antigravity-writes-outside-",
+      });
+      const outsideFile = path.join(outside, "secret.txt");
+      yield* fileSystem.writeFileString(outsideFile, "secret");
+      const { writeTextFile } = yield* openWriteSession("1.4.6", workspace);
+      if (writeTextFile === undefined) {
+        return yield* Effect.die("the fixed release must serve client writes");
+      }
+      const write = (target: string, content: string) =>
+        writeTextFile(
+          { sessionId: "mock-session-1", path: target, content },
+          { requestId: `write-${target}`, method: "fs/write_text_file" },
+        ).pipe(Effect.exit);
+
+      const inside = path.join(workspace, "src", "inside.ts");
+      assert.isTrue(Exit.isSuccess(yield* write(inside, "inside")));
+      assert.equal(yield* fileSystem.readFileString(inside), "inside");
+
+      const bom = new Uint8Array([0xef, 0xbb, 0xbf]);
+      const withBom = path.join(workspace, "bom.cs");
+      yield* fileSystem.writeFile(withBom, new Uint8Array([...bom, ...Buffer.from("old")]));
+      yield* write(withBom, "new");
+      assert.deepEqual(
+        Array.from(yield* fileSystem.readFile(withBom)),
+        Array.from(new Uint8Array([...bom, ...Buffer.from("new")])),
+      );
+      yield* write(withBom, "\uFEFFnewer");
+      // Content that brings its own mark keeps exactly one.
+      assert.deepEqual(
+        Array.from(yield* fileSystem.readFile(withBom)),
+        Array.from(new Uint8Array([...bom, ...Buffer.from("newer")])),
+      );
+
+      assert.isTrue(Exit.isFailure(yield* write(path.join(outside, "planted.txt"), "x")));
+      assert.isFalse(yield* fileSystem.exists(path.join(outside, "planted.txt")));
+      const linkPath = path.join(workspace, "linked-secret.txt");
+      yield* fileSystem.symlink(outsideFile, linkPath);
+      assert.isTrue(Exit.isFailure(yield* write(linkPath, "overwritten")));
+      assert.equal(yield* fileSystem.readFileString(outsideFile), "secret");
+      const plantedTarget = path.join(outside, "created-through-link.txt");
+      yield* fileSystem.symlink(plantedTarget, path.join(workspace, "dangling.txt"));
+      assert.isTrue(Exit.isFailure(yield* write(path.join(workspace, "dangling.txt"), "x")));
+      assert.isFalse(yield* fileSystem.exists(plantedTarget));
+      yield* fileSystem.symlink(outside, path.join(workspace, "linked-dir"));
+      assert.isTrue(
+        Exit.isFailure(yield* write(path.join(workspace, "linked-dir", "a", "b", "file.txt"), "x")),
+      );
+      assert.isFalse(yield* fileSystem.exists(path.join(outside, "a")));
     }).pipe(Effect.provide(layerSession), Effect.scoped),
   );
 });
